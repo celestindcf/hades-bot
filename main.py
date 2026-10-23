@@ -2,15 +2,18 @@ import discord
 from discord.ext import commands
 import json
 import os
+import asyncio
+from aiohttp import web
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
+# ═══════════════════════════════════════════════════════════
+#   CONFIGURATION
+# ═══════════════════════════════════════════════════════════
 def load_config():
-    """Charge la config depuis .env / variables d'env (priorité) ou config.json."""
     config = {}
-
     token_from_env = os.getenv("DISCORD_TOKEN")
 
     if token_from_env:
@@ -30,48 +33,33 @@ def load_config():
     else:
         raise FileNotFoundError(
             "❌ Aucune configuration trouvée !\n"
-            "Définis DISCORD_TOKEN dans les variables d'environnement "
-            "ou crée un config.json."
+            "Définis DISCORD_TOKEN dans les variables d'environnement."
         )
-
     return config
 
 
 def validate_token(token: str) -> bool:
-    """Valide le format basique d'un token Discord."""
     if not token:
         print("❌ Token vide !")
         return False
-
     cleaned = token.strip().strip('"').strip("'")
-
     if cleaned.startswith("Bot "):
         print("❌ Le token ne doit PAS commencer par 'Bot '")
-        print("   → Retire le préfixe 'Bot ' dans la variable d'env")
         return False
-
     if cleaned == "TON_TOKEN_ICI":
-        print("❌ Tu utilises le token placeholder de config.example.json !")
-        print("   → Mets le VRAI token Discord dans la variable DISCORD_TOKEN")
+        print("❌ Token placeholder détecté !")
         return False
-
-    parts = cleaned.split(".")
-    if len(parts) != 3:
-        print(f"❌ Format de token invalide ({len(parts)} parties, attendu 3)")
-        print("   → Un token Discord ressemble à : XXXXXX.YYYYYY.ZZZZZZ")
+    if len(cleaned.split(".")) != 3:
+        print("❌ Format de token invalide (attendu 3 parties)")
         return False
-
     if len(cleaned) < 50:
-        print(f"❌ Token trop court ({len(cleaned)} chars) — probablement tronqué")
+        print(f"❌ Token trop court ({len(cleaned)} chars)")
         return False
-
     return True
 
 
 def save_config(config: dict):
-    """Sauvegarde dans .env ou config.json."""
     if os.path.exists(".env"):
-        lines = []
         mapping = {
             "token": "DISCORD_TOKEN",
             "verified_role": "VERIFIED_ROLE",
@@ -80,9 +68,7 @@ def save_config(config: dict):
             "log_channel": "LOG_CHANNEL",
             "embed_color": "EMBED_COLOR",
         }
-        for key, env_key in mapping.items():
-            if key in config:
-                lines.append(f"{env_key}={config[key]}")
+        lines = [f"{env_key}={config[key]}" for key, env_key in mapping.items() if key in config]
         with open(".env", "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
     else:
@@ -96,13 +82,16 @@ except FileNotFoundError as e:
     print(e)
     exit(1)
 
-# --- DEBUG (masqué pour la sécurité) ---
 token = CONFIG["token"]
 print(f"🔍 Token détecté : {token[:6]}...{token[-4:]} (longueur: {len(token)})")
 
 if not validate_token(token):
     exit(1)
 
+
+# ═══════════════════════════════════════════════════════════
+#   BOT DISCORD
+# ═══════════════════════════════════════════════════════════
 intents = discord.Intents.all()
 
 
@@ -140,22 +129,71 @@ class HadesBot(commands.Bot):
         )
 
 
+# ═══════════════════════════════════════════════════════════
+#   SERVEUR HTTP (pour Fly.io / Render health checks)
+# ═══════════════════════════════════════════════════════════
+async def health_check(request):
+    """Endpoint de health check pour Fly.io."""
+    return web.Response(
+        text=json.dumps({
+            "status": "ok",
+            "bot": "HADES",
+            "ready": bot.is_ready() if 'bot' in globals() else False
+        }),
+        content_type="application/json"
+    )
+
+
+async def root(request):
+    """Page racine simple."""
+    return web.Response(
+        text="🛡️ HADES Security Bot is running",
+        content_type="text/plain"
+    )
+
+
+async def start_web_server():
+    """Démarre un serveur HTTP minimal pour les health checks Fly.io."""
+    app = web.Application()
+    app.router.add_get("/", root)
+    app.router.add_get("/health", health_check)
+    app.router.add_get("/healthz", health_check)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"🌐 Serveur HTTP démarré sur 0.0.0.0:{port}")
+
+
+# ═══════════════════════════════════════════════════════════
+#   LANCEMENT
+# ═══════════════════════════════════════════════════════════
 bot = HadesBot()
 
-try:
+
+async def main():
+    # Démarre le serveur HTTP AVANT le bot (pour que Fly.io détecte le port)
+    await start_web_server()
     print("🚀 Tentative de connexion à Discord...")
-    bot.run(CONFIG["token"])
-except discord.LoginFailure:
-    print("\n" + "=" * 60)
-    print("❌ ÉCHEC D'AUTHENTIFICATION")
-    print("=" * 60)
-    print("Causes possibles :")
-    print("  1. Token invalide ou expiré → reset sur le portail Discord")
-    print("  2. Token mal copié (espaces, guillemets, 'Bot ')")
-    print("  3. Variable DISCORD_TOKEN absente sur Render")
-    print("  4. Bot supprimé de l'application Discord")
-    print("\n👉 Va sur https://discord.com/developers/applications")
-    print("   → Ton app → Bot → Reset Token → Copie le nouveau")
-    print("   → Render → Environment → DISCORD_TOKEN = <nouveau>")
-    print("=" * 60)
-    exit(1)
+
+    try:
+        await bot.start(CONFIG["token"])
+    except discord.LoginFailure:
+        print("\n" + "=" * 60)
+        print("❌ ÉCHEC D'AUTHENTIFICATION")
+        print("=" * 60)
+        print("  1. Token invalide ou expiré → reset sur le portail Discord")
+        print("  2. Token mal copié (espaces, guillemets, 'Bot ')")
+        print("  3. Variable DISCORD_TOKEN absente")
+        print("=" * 60)
+        exit(1)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n👋 Arrêt du bot...")
